@@ -43,6 +43,9 @@ std::nullopt_t failf(const char *fmt, ...)
 	return std::nullopt;
 }
 
+template <typename T>
+T clamp(T value, T min_v, T max_v) { return std::min(std::max(value, min_v), max_v); }
+
 struct BakeEntry
 {
 	ufbx_node *high_node = nullptr;
@@ -53,8 +56,7 @@ struct Vertex
 {
 	um_vec3 position;
 	um_vec3 normal;
-	um_vec2 uv0;
-	um_vec2 uv1;
+	um_vec2 uv;
 };
 
 struct Mesh
@@ -87,12 +89,19 @@ struct Target
 	}
 };
 
+struct PixelRegion
+{
+	size_t min_x, min_y;
+	size_t max_x, max_y;
+};
+
 struct TraceState
 {
 	const Mesh &low_mesh;
 	const rtk_scene *low_uv_scene;
 	const rtk_scene *high_scene;
 	std::atomic_uint32_t tile_index;
+	PixelRegion region;
 };
 
 struct Tracer
@@ -101,6 +110,7 @@ struct Tracer
 
 	Target target;
 	size_t samples;
+	std::vector<um_vec2> sample_offsets;
 
 	size_t thread_count;
 	size_t tiles_x;
@@ -112,24 +122,6 @@ struct Tracer
 
 	std::mutex print_mutex;
 };
-
-struct RandomGenerator {
-    uint64_t a, b;
-
-	RandomGenerator() : a(1), b(5) { next(); }
-	RandomGenerator(uint64_t seed) : a(seed), b(1) { next(); }
-
-	uint64_t next() { 
-		uint64_t x = a, y = b;
-		a = y;
-		x ^= x << 23;
-		x ^= x >> 17;
-		x ^= y;
-		b = x + y;
-		return x;
-	}
-};
-
 
 template <> struct ufbx_converter<um_vec2> {
 	static inline um_vec2 from(const ufbx_vec2 &v) { return { (float)v.x, (float)v.y }; }
@@ -168,11 +160,8 @@ std::optional<Mesh> create_mesh(ufbx_node *node)
 			v.normal = ufbx_transform_direction(&normal_to_world, ufbx_get_vertex_vec3(&mesh->vertex_normal, ix));
 			v.normal = um_normalize3(v.normal);
 
-			if (mesh->uv_sets.count >= 1) {
-				v.uv0 = ufbx_get_vertex_vec2(&mesh->uv_sets[0].vertex_uv, ix);
-			}
-			if (mesh->uv_sets.count >= 2) {
-				v.uv1 = ufbx_get_vertex_vec2(&mesh->uv_sets[1].vertex_uv, ix);
+			if (mesh->vertex_uv.exists) {
+				v.uv = ufbx_get_vertex_vec2(&mesh->vertex_uv, ix);
 			}
 			result.vertices.push_back(v);
 		}
@@ -196,6 +185,28 @@ std::optional<Mesh> create_mesh(ufbx_node *node)
 	return result;
 }
 
+template <uint32_t Base>
+float radical_inverse(uint32_t bits)
+{
+	constexpr double rcp_base = 1.0 / (double)Base;
+
+	double value = 0.0, step = 1.0;
+	while (bits) {
+		step *= rcp_base;
+		value += step * (bits % Base);
+		bits /= Base;
+	}
+
+	return (float)value;
+}
+
+um_vec2 halton_sequence(size_t index, size_t count)
+{
+	float u = radical_inverse<2>((uint32_t)index);
+	float v = radical_inverse<3>((uint32_t)index);
+	return { u, v };
+}
+
 void trace_tile(Tracer &tracer, TraceState &state, size_t x, size_t y, size_t tile_index)
 {
 	Target &target = tracer.target;
@@ -205,18 +216,24 @@ void trace_tile(Tracer &tracer, TraceState &state, size_t x, size_t y, size_t ti
 	size_t max_x = std::min(min_x + tracer.tile_size, target.width);
 	size_t max_y = std::min(min_y + tracer.tile_size, target.height);
 
-	float tile[Tracer::tile_size][Tracer::tile_size] = { };
+	if (min_x >= state.region.max_x) return;
+	if (min_y >= state.region.max_y) return;
+	if (max_x <= state.region.min_x) return;
+	if (max_y <= state.region.min_y) return;
 
-	RandomGenerator rng { tile_index };
+	float tile[Tracer::tile_size][Tracer::tile_size] = { };
 
 	for (size_t x = min_x; x < max_x; x++) {
 		for (size_t y = min_y; y < max_y; y++) {
-			um_vec2 uv;
-			uv.x = ((float)x + 0.5f) / (float)target.width;
-			uv.y = ((float)y + 0.5f) / (float)target.height;
 
 			float sum = 0.0f;
 			for (size_t i = 0; i < tracer.samples; i++) {
+				um_vec2 offset = tracer.sample_offsets[i];
+
+				um_vec2 uv;
+				uv.x = ((float)x + offset.x) / (float)target.width;
+				uv.y = ((float)y + offset.y) / (float)target.height;
+
 				um_vec3 uv_origin = { uv.x, uv.y, 0.0f };
 				um_vec3 uv_direction = { 0.0f, 0.0f, 1.0f };
 
@@ -294,14 +311,14 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 		std::vector<um_vec3> uv_vertices;
 
 		for (const Vertex &v : low_mesh.vertices) {
-			uv_vertices.push_back({ v.uv0.x, v.uv0.y, 0.0f });
+			uv_vertices.push_back({ v.uv.x, v.uv.y, 0.0f });
 		}
 
 		rtk_mesh mesh = { };
 		mesh.vertices = (rtk_vec3*)uv_vertices.data();
 		mesh.normals = (rtk_vec3*)((char*)low_mesh.vertices.data() + offsetof(Vertex, normal));
 		mesh.normals_stride = sizeof(Vertex);
-		mesh.uvs = (rtk_vec2*)((char*)low_mesh.vertices.data() + offsetof(Vertex, uv0));
+		mesh.uvs = (rtk_vec2*)((char*)low_mesh.vertices.data() + offsetof(Vertex, uv));
 		mesh.uvs_stride = sizeof(Vertex);
 		mesh.indices = low_mesh.indices.data();
 		mesh.num_triangles = low_mesh.indices.size() / 3;
@@ -321,7 +338,7 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 		mesh.vertices_stride = sizeof(Vertex);
 		mesh.normals = (rtk_vec3*)((char*)high_mesh.vertices.data() + offsetof(Vertex, normal));
 		mesh.normals_stride = sizeof(Vertex);
-		mesh.uvs = (rtk_vec2*)((char*)high_mesh.vertices.data() + offsetof(Vertex, uv0));
+		mesh.uvs = (rtk_vec2*)((char*)high_mesh.vertices.data() + offsetof(Vertex, uv));
 		mesh.uvs_stride = sizeof(Vertex);
 		mesh.indices = high_mesh.indices.data();
 		mesh.num_triangles = high_mesh.indices.size() / 3;
@@ -340,6 +357,25 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 	TraceState state = { low_mesh };
 	state.low_uv_scene = low_uv_scene.get();
 	state.high_scene = high_scene.get();
+
+	{
+		um_vec2 min_uv = um_dup2(+INFINITY);
+		um_vec2 max_uv = um_dup2(-INFINITY);
+
+		for (Vertex &v : low_mesh.vertices) {
+			min_uv.x = std::min(min_uv.x, v.uv.x);
+			min_uv.y = std::min(min_uv.y, v.uv.y);
+			max_uv.x = std::max(max_uv.x, v.uv.x);
+			max_uv.y = std::max(max_uv.y, v.uv.y);
+		}
+
+		float width = (float)tracer.target.width;
+		float height = (float)tracer.target.height;
+		state.region.min_x = (size_t)clamp(min_uv.x * width - 1.0f, 0.0f, width);
+		state.region.min_y = (size_t)clamp(min_uv.y * height - 1.0f, 0.0f, width);
+		state.region.max_x = (size_t)clamp(max_uv.x * width + 1.0f, 0.0f, width);
+		state.region.max_y = (size_t)clamp(max_uv.y * height + 1.0f, 0.0f, width);
+	}
 
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < tracer.thread_count; i++) {
@@ -399,7 +435,7 @@ int main(int argc, char **argv)
 	tracer.thread_count = (size_t)std::thread::hardware_concurrency();
 	tracer.ray_dist_front = 1000.0f;
 	tracer.ray_dist_back = 1000.0f;
-	tracer.samples = 32;
+	tracer.samples = 256;
 
 	im_arg_begin_c(argc, argv);
 	while (im_arg_next()) {
@@ -441,7 +477,7 @@ int main(int argc, char **argv)
 	}
 
 	if (source_path.empty()) fatalf("Error: Source path not specified");
-	if (output_path.empty()) fatalf("Error: Source path not specified");
+	if (output_path.empty()) fatalf("Error: Output path not specified");
 
 	ufbx_load_opts opts = { };
 	opts.target_axes = ufbx_axes_right_handed_y_up;
@@ -460,6 +496,11 @@ int main(int argc, char **argv)
 	tracer.tiles_y = (tracer.target.height + Tracer::tile_size - 1) / Tracer::tile_size;
 	tracer.tile_count = tracer.tiles_x * tracer.tiles_y;
 
+	tracer.sample_offsets.resize(tracer.samples);
+	for (size_t i = 0; i < tracer.samples; i++) {
+		tracer.sample_offsets[i] = halton_sequence(i, tracer.samples);
+	}
+
 	std::unordered_map<std::string, BakeEntry> entries;
 
 	for (ufbx_node *node : scene->nodes) {
@@ -476,6 +517,11 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (entries.empty()) fatalf("No models found, see --help for configuration options");
+
+	printf("Found %zu models, starting to bake: %zux%zu texture, %zu samples/pixel.\nPress ctrl+C to cancel.\n\n",
+		entries.size(), tracer.target.width, tracer.target.height, tracer.samples);
+
 	size_t ok_count = 0;
 	size_t total_count = 0;
 	for (const auto &[name, entry] : entries) {
@@ -487,9 +533,10 @@ int main(int argc, char **argv)
 		total_count++;
 	}
 
-	save_result(tracer.target, output_path, invert_y);
-
 	printf("\n%zu/%zu succeeded\n", ok_count, total_count);
+
+	save_result(tracer.target, output_path, invert_y);
+	printf("Saved output to: %s\n", output_path.c_str());
 
 	if (ok_count < total_count)
 		return 1;
