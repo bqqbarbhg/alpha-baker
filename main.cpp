@@ -89,8 +89,9 @@ struct Target
 
 struct TraceState
 {
-	rtk_scene *low_uv_scene;
-	rtk_scene *high_scene;
+	const Mesh &low_mesh;
+	const rtk_scene *low_uv_scene;
+	const rtk_scene *high_scene;
 	std::atomic_uint32_t tile_index;
 };
 
@@ -106,19 +107,43 @@ struct Tracer
 	size_t tiles_y;
 	size_t tile_count;
 
+	float ray_dist_front;
+	float ray_dist_back;
+
 	std::mutex print_mutex;
 };
+
+struct RandomGenerator {
+    uint64_t a, b;
+
+	RandomGenerator() : a(1), b(5) { next(); }
+	RandomGenerator(uint64_t seed) : a(seed), b(1) { next(); }
+
+	uint64_t next() { 
+		uint64_t x = a, y = b;
+		a = y;
+		x ^= x << 23;
+		x ^= x >> 17;
+		x ^= y;
+		b = x + y;
+		return x;
+	}
+};
+
 
 template <> struct ufbx_converter<um_vec2> {
 	static inline um_vec2 from(const ufbx_vec2 &v) { return { (float)v.x, (float)v.y }; }
 };
 template <> struct ufbx_converter<um_vec3> {
-	static inline um_vec3 from(const ufbx_vec3 &v) { return { (float)v.x, (float)v.y, (float)v.y }; }
+	static inline um_vec3 from(const ufbx_vec3 &v) { return { (float)v.x, (float)v.y, (float)v.z }; }
 };
 
 template<> struct std::default_delete<rtk_scene> {
 	void operator()(rtk_scene *ptr) const { rtk_free_scene(ptr); }
 };
+
+static um_vec3 from_rtk(const rtk_vec3 &v) { return { v.x, v.y, v.z }; }
+static rtk_vec3 to_rtk(const um_vec3 &v) { return { v.x, v.y, v.z }; }
 
 std::optional<Mesh> create_mesh(ufbx_node *node)
 {
@@ -141,6 +166,8 @@ std::optional<Mesh> create_mesh(ufbx_node *node)
 			Vertex v = { };
 			v.position = ufbx_transform_position(&geometry_to_world, ufbx_get_vertex_vec3(&mesh->vertex_position, ix));
 			v.normal = ufbx_transform_direction(&normal_to_world, ufbx_get_vertex_vec3(&mesh->vertex_normal, ix));
+			v.normal = um_normalize3(v.normal);
+
 			if (mesh->uv_sets.count >= 1) {
 				v.uv0 = ufbx_get_vertex_vec2(&mesh->uv_sets[0].vertex_uv, ix);
 			}
@@ -150,7 +177,6 @@ std::optional<Mesh> create_mesh(ufbx_node *node)
 			result.vertices.push_back(v);
 		}
 	}
-
 
 	ufbx_vertex_stream stream = { };
 	stream.data = result.vertices.data();
@@ -170,7 +196,7 @@ std::optional<Mesh> create_mesh(ufbx_node *node)
 	return result;
 }
 
-void trace_tile(Tracer &tracer, TraceState &state, size_t x, size_t y)
+void trace_tile(Tracer &tracer, TraceState &state, size_t x, size_t y, size_t tile_index)
 {
 	Target &target = tracer.target;
 
@@ -181,34 +207,64 @@ void trace_tile(Tracer &tracer, TraceState &state, size_t x, size_t y)
 
 	float tile[Tracer::tile_size][Tracer::tile_size] = { };
 
+	RandomGenerator rng { tile_index };
+
 	for (size_t x = min_x; x < max_x; x++) {
 		for (size_t y = min_y; y < max_y; y++) {
 			um_vec2 uv;
 			uv.x = ((float)x + 0.5f) / (float)target.width;
 			uv.y = ((float)y + 0.5f) / (float)target.height;
 
+			float sum = 0.0f;
+			for (size_t i = 0; i < tracer.samples; i++) {
+				um_vec3 uv_origin = { uv.x, uv.y, 0.0f };
+				um_vec3 uv_direction = { 0.0f, 0.0f, 1.0f };
 
+				rtk_hit uv_hit;
+				rtk_ray uv_ray = { to_rtk(uv_origin), to_rtk(uv_direction), -1.0f };
+				if (!rtk_raytrace(state.low_uv_scene, &uv_ray, &uv_hit, 1.0f)) continue;
+
+				um_vec3 p0 = state.low_mesh.vertices[uv_hit.vertex_index[0]].position;
+				um_vec3 p1 = state.low_mesh.vertices[uv_hit.vertex_index[1]].position;
+				um_vec3 p2 = state.low_mesh.vertices[uv_hit.vertex_index[2]].position;
+
+				float w = 1.0f - uv_hit.geom.u - uv_hit.geom.v;
+				um_vec3 position = p0 * uv_hit.geom.u + p1 * uv_hit.geom.v + p2 * w;
+				um_vec3 normal = um_normalize3(from_rtk(uv_hit.interp.normal));
+
+				um_vec3 high_origin = position;
+				um_vec3 high_direction = normal;
+
+				rtk_hit high_hit;
+				rtk_ray high_ray = { to_rtk(high_origin), to_rtk(high_direction), -tracer.ray_dist_back };
+				if (!rtk_raytrace(state.high_scene, &high_ray, &high_hit, tracer.ray_dist_front)) continue;
+
+				sum += 1.0f;
+			}
+
+			tile[y - min_y][x - min_x] = sum / (float)tracer.samples;
 		}
 	}
 
 	for (size_t x = min_x; x < max_x; x++) {
 		for (size_t y = min_y; y < max_y; y++) {
-			target.at(x, y) = tile[y - min_y][x - min_x];
+			float &result = target.at(x, y);
+			result = std::max(result, tile[y - min_y][x - min_x]);
 		}
 	}
 }
 
 void trace_thread(Tracer &tracer, TraceState &state)
 {
-	size_t report_rate = tracer.tile_count / 32;
+	size_t report_rate = std::max(tracer.tile_count / 32, (size_t)1);
 
 	for (;;) {
 		size_t tile_index = state.tile_index.fetch_add(1u, std::memory_order_relaxed);
 		if (tile_index >= tracer.tile_count) break;
 
 		size_t tile_x = tile_index % tracer.tiles_x;
-		size_t tile_y = tile_index % tracer.tiles_y;
-		trace_tile(tracer, state, tile_x, tile_y);
+		size_t tile_y = tile_index / tracer.tiles_y;
+		trace_tile(tracer, state, tile_x, tile_y, tile_index);
 
 		if (((tile_index + 1) % report_rate) == 0) {
 			std::lock_guard lg { tracer.print_mutex };
@@ -225,7 +281,7 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 	std::optional<Mesh> low_mesh_opt = create_mesh(entry.low_node);
 	if (!low_mesh_opt) return failf("Failed to create low-poly mesh");
 
-	std::optional<Mesh> high_mesh_opt = create_mesh(entry.low_node);
+	std::optional<Mesh> high_mesh_opt = create_mesh(entry.high_node);
 	if (!high_mesh_opt) return failf("Failed to create high-poly mesh");
 
 	Mesh low_mesh = std::move(*low_mesh_opt);
@@ -281,7 +337,7 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 
 	printf("Processing ");
 
-	TraceState state;
+	TraceState state = { low_mesh };
 	state.low_uv_scene = low_uv_scene.get();
 	state.high_scene = high_scene.get();
 
@@ -299,6 +355,35 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 	return true;
 }
 
+void save_result(const Target &target, const std::string &path, bool invert_y)
+{
+	size_t pixel_count = target.width * target.height;
+	std::vector<uint8_t> result;
+	result.resize(target.width * target.height * 3);
+
+	size_t dst_ix = 0;
+	for (size_t y = 0; y < target.height; y++) {
+		// Sic: Use top-left by default
+		size_t src_y = invert_y ? y : target.height - y - 1;
+
+		for (size_t x = 0; x < target.width; x++) {
+			float value = target.at(x, src_y);
+			value = std::max(value, 0.0f);
+			value = std::min(value, 1.0f);
+
+			uint8_t b = (uint8_t)(value * 255.0f);
+			result[dst_ix + 0] = b;
+			result[dst_ix + 1] = b;
+			result[dst_ix + 2] = b;
+			dst_ix += 3;
+		}
+	}
+
+	if (!stbi_write_png(path.c_str(), (int)target.width, (int)target.height, 3, result.data(), 0)) {
+		fatalf("Failed to write output file");
+	}
+}
+
 int main(int argc, char **argv)
 {
 	std::string source_path;
@@ -308,17 +393,22 @@ int main(int argc, char **argv)
 	std::string_view low_suffix = " Low";
 
 	size_t resolution = 1024;
-	size_t samples = 32;
-	size_t threads = (size_t)std::thread::hardware_concurrency();
+	bool invert_y = false;
+
+	Tracer tracer = { };
+	tracer.thread_count = (size_t)std::thread::hardware_concurrency();
+	tracer.ray_dist_front = 1000.0f;
+	tracer.ray_dist_back = 1000.0f;
+	tracer.samples = 32;
 
 	im_arg_begin_c(argc, argv);
 	while (im_arg_next()) {
 		im_arg_help("--help", "Show help");
 
-		if (im_arg("path", "Path for input FBX")) {
+		if (im_arg("path", "Path for input .fbx file")) {
 			source_path = im_arg_str(0);
 		}
-		if (im_arg("-o output", "Output path")) {
+		if (im_arg("-o output", "Output .png path")) {
 			output_path = im_arg_str(0);
 		}
 
@@ -327,7 +417,7 @@ int main(int argc, char **argv)
 			resolution = (size_t)im_arg_int_range(0, 1, 1 << 18);
 		}
 		if (im_arg("--samples S", "Number of samples to use")) {
-			samples = (size_t)im_arg_int_range(0, 1, INT_MAX);
+			tracer.samples = (size_t)im_arg_int_range(0, 1, INT_MAX);
 		}
 		if (im_arg("--high-suffix suffix", "Suffix for high-poly meshes")) {
 			high_suffix = im_arg_str(0);
@@ -335,10 +425,18 @@ int main(int argc, char **argv)
 		if (im_arg("--low-suffix suffix", "Suffix for low-poly meshes")) {
 			low_suffix = im_arg_str(0);
 		}
+		if (im_arg("--ray-range range", "Ray distance range")) {
+			float dist = (float)im_arg_double_range(0, 0.0, 10000000.0);
+			tracer.ray_dist_back = dist;
+			tracer.ray_dist_front = dist;
+		}
+		if (im_arg("--invert-y", "Invert Y axis in the result")) {
+			invert_y = true;
+		}
 
 		im_arg_category("Performance");
 		if (im_arg("--threads N", "Number of threads to use")) {
-			threads = (size_t)im_arg_int_range(0, 1, 1024);
+			tracer.thread_count = (size_t)im_arg_int_range(0, 1, 1024);
 		}
 	}
 
@@ -356,10 +454,7 @@ int main(int argc, char **argv)
 		fatalf("Failed to load: %s\n%s", source_path, ufbx_format_error_string(error).c_str());
 	}
 
-	Tracer tracer;
 	tracer.target = Target{ resolution, resolution };
-	tracer.samples = samples;
-	tracer.thread_count = threads;
 
 	tracer.tiles_x = (tracer.target.width + Tracer::tile_size - 1) / Tracer::tile_size;
 	tracer.tiles_y = (tracer.target.height + Tracer::tile_size - 1) / Tracer::tile_size;
@@ -391,6 +486,8 @@ int main(int argc, char **argv)
 		if (result) ok_count++;
 		total_count++;
 	}
+
+	save_result(tracer.target, output_path, invert_y);
 
 	printf("\n%zu/%zu succeeded\n", ok_count, total_count);
 

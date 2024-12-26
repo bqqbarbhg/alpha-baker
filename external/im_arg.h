@@ -33,6 +33,8 @@ void im_arg_vhelpf(const char *fmt, va_list args);
 size_t im_arg_count();
 int im_arg_int(size_t index);
 int im_arg_int_range(size_t index, int min_value, int max_value);
+double im_arg_double(size_t index);
+double im_arg_double_range(size_t index, double min_value, double max_value);
 const char *im_arg_str(size_t index);
 
 void im_arg_fail(const char *description);
@@ -54,6 +56,8 @@ void im_arg_begin_c_ctx(im_arg_context *ctx, int argc, char **argv);
 size_t im_arg_count_ctx(im_arg_context *ctx);
 int im_arg_int_ctx(im_arg_context *ctx, size_t index);
 int im_arg_int_range_ctx(im_arg_context *ctx, size_t index, int min_value, int max_value);
+double im_arg_double_ctx(im_arg_context *ctx, size_t index);
+double im_arg_double_range_ctx(im_arg_context *ctx, size_t index, double min_value, double max_value);
 const char *im_arg_str_ctx(im_arg_context *ctx, size_t index);
 
 void im_arg_show_help_ctx(im_arg_context *ctx);
@@ -81,6 +85,7 @@ bool im_arg_unknown_ctx(im_arg_context *ctx);
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <float.h>
 
 typedef enum {
 	IM_ARG__STATE_INITIAL,
@@ -365,6 +370,16 @@ int im_arg_int_range(size_t index, int min_value, int max_value)
 	return im_arg_int_range_ctx(&im_arg_global, index, min_value, max_value);
 }
 
+double im_arg_double(size_t index)
+{
+	return im_arg_double_ctx(&im_arg_global, index);
+}
+
+double im_arg_double_range(size_t index, double min_value, double max_value)
+{
+	return im_arg_double_range_ctx(&im_arg_global, index, min_value, max_value);
+}
+
 const char *im_arg_str_ctx(im_arg_context *ctx, size_t index)
 {
 	im_arg__assert(index < ctx->arg_count);
@@ -409,6 +424,41 @@ int im_arg_int_range_ctx(im_arg_context *ctx, size_t index, int min_value, int m
 	}
 	return (int)value;
 }
+
+double im_arg_double_ctx(im_arg_context *ctx, size_t index)
+{
+	return im_arg_double_range_ctx(ctx, index, -INFINITY, INFINITY);
+}
+
+double im_arg_double_range_ctx(im_arg_context *ctx, size_t index, double min_value, double max_value)
+{
+	const char *arg = im_arg_str_ctx(ctx, index);
+	char *end = NULL;
+	double value = strtod(arg, &end);
+	if (!end || *end || isnan(value)) {
+		if (ctx->arg_count == 1) {
+			im_arg__errorf(ctx, "expected decimal number for '%s', got '%s'", ctx->opt, arg);
+		} else {
+			im_arg__errorf(ctx, "expected decimal number for '%s' argument %zu, got '%s'", ctx->opt, index, arg);
+		}
+	}
+	if (value < min_value) {
+		if (ctx->arg_count == 1) {
+			im_arg__errorf(ctx, "value for '%s' is too low, minimum is %f", ctx->opt, min_value);
+		} else {
+			im_arg__errorf(ctx, "value for '%s' argument %zu is too low, minimum is %f", ctx->opt, index, min_value);
+		}
+	}
+	if (value > max_value) {
+		if (ctx->arg_count == 1) {
+			im_arg__errorf(ctx, "value for '%s' is too high, maximum is %f", ctx->opt, max_value);
+		} else {
+			im_arg__errorf(ctx, "value for '%s' argument %zu is too high, maximum is %f", ctx->opt, index, max_value);
+		}
+	}
+	return (int)value;
+}
+
 
 bool im_arg_help_ctx(im_arg_context *ctx, const char *help, const char *description)
 {
