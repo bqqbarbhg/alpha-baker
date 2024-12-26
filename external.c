@@ -1,4 +1,9 @@
 
+#include "external/ufbx.h"
+
+#define UFBX_OS_IMPLEMENTATION
+#include "external/ufbx_os.h"
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "external/stb_image.h"
 

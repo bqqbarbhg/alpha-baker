@@ -6,6 +6,7 @@
 #include <assert.h>
 
 #include "external/ufbx.h"
+#include "external/ufbx_os.h"
 #include "external/ufbx_stl.h"
 #include "external/umath.h"
 #include "external/rtk.h"
@@ -17,11 +18,28 @@
 #include <unordered_map>
 #include <optional>
 #include <memory>
-#include <thread>
-#include <atomic>
 #include <mutex>
 #include <chrono>
 #include <algorithm>
+#include <functional>
+
+template <> struct ufbx_converter<um_vec2> {
+	static inline um_vec2 from(const ufbx_vec2 &v) { return { (float)v.x, (float)v.y }; }
+};
+template <> struct ufbx_converter<um_vec3> {
+	static inline um_vec3 from(const ufbx_vec3 &v) { return { (float)v.x, (float)v.y, (float)v.z }; }
+};
+
+template<> struct std::default_delete<rtk_scene> {
+	void operator()(rtk_scene *ptr) const { rtk_free_scene(ptr); }
+};
+
+template<> struct std::default_delete<ufbx_os_thread_pool> {
+	void operator()(ufbx_os_thread_pool *ptr) const { ufbx_os_free_thread_pool(ptr); }
+};
+
+static um_vec3 from_rtk(const rtk_vec3 &v) { return { v.x, v.y, v.z }; }
+static rtk_vec3 to_rtk(const um_vec3 &v) { return { v.x, v.y, v.z }; }
 
 [[noreturn]] void fatalf(const char *fmt, ...)
 {
@@ -124,29 +142,35 @@ struct Tracer
 	size_t samples;
 	std::vector<um_vec2> sample_offsets;
 
-	size_t thread_count;
+	uint32_t thread_count;
 	size_t tiles_x;
 	size_t tiles_y;
 
 	float ray_dist_front;
 	float ray_dist_back;
 
+	std::unique_ptr<ufbx_os_thread_pool> thread_pool;
 	std::mutex print_mutex;
 };
 
-template <> struct ufbx_converter<um_vec2> {
-	static inline um_vec2 from(const ufbx_vec2 &v) { return { (float)v.x, (float)v.y }; }
-};
-template <> struct ufbx_converter<um_vec3> {
-	static inline um_vec3 from(const ufbx_vec3 &v) { return { (float)v.x, (float)v.y, (float)v.z }; }
-};
+template <typename Task>
+uint64_t start_tasks(Tracer &tracer, uint32_t count, Task task)
+{
+	auto entry = [](void *user, uint32_t index) { (*(const Task*)user)(index); };
+	return ufbx_os_thread_pool_run(tracer.thread_pool.get(), entry, (void*)&task, count);
+}
 
-template<> struct std::default_delete<rtk_scene> {
-	void operator()(rtk_scene *ptr) const { rtk_free_scene(ptr); }
-};
+void wait_tasks(Tracer &tracer, uint64_t id)
+{
+	ufbx_os_thread_pool_wait(tracer.thread_pool.get(), id);
+}
 
-static um_vec3 from_rtk(const rtk_vec3 &v) { return { v.x, v.y, v.z }; }
-static rtk_vec3 to_rtk(const um_vec3 &v) { return { v.x, v.y, v.z }; }
+template <typename Task>
+void run_threaded(Tracer &tracer, Task task)
+{
+	uint64_t id = start_tasks(tracer, tracer.thread_count, task);
+	wait_tasks(tracer, id);
+}
 
 std::optional<Mesh> create_mesh(ufbx_node *node)
 {
@@ -425,18 +449,13 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 	const uint32_t total_progress = 32;
 	double max_tile = (double)(state.tiles.size() - 1);
 	for (uint32_t prog = 0; prog < total_progress; prog++) {
-		size_t index = clamp((double)prog / (double)(total_progress - 1) * max_tile, 0.0, max_tile);
+		size_t index = (size_t)clamp((double)prog / (double)(total_progress - 1) * max_tile, 0.0, max_tile);
 		state.tiles[index].progress_count++;
 	}
 
-	std::vector<std::thread> threads;
-	for (size_t i = 0; i < tracer.thread_count; i++) {
-		threads.push_back(std::thread(trace_thread, std::ref(tracer), std::ref(state)));
-	}
-
-	for (std::thread &t : threads) {
-		t.join();
-	}
+	run_threaded(tracer, [&](uint32_t thread_id) {
+		trace_thread(tracer, state);
+	});
 
 	return true;
 }
@@ -482,7 +501,7 @@ int main(int argc, char **argv)
 	bool invert_y = false;
 
 	Tracer tracer = { };
-	tracer.thread_count = (size_t)std::thread::hardware_concurrency();
+	tracer.thread_count = (uint32_t)std::thread::hardware_concurrency();
 	tracer.ray_dist_front = 1000.0f;
 	tracer.ray_dist_back = 1000.0f;
 	tracer.samples = 256;
@@ -522,17 +541,24 @@ int main(int argc, char **argv)
 
 		im_arg_category("Performance");
 		if (im_arg("--threads N", "Number of threads to use")) {
-			tracer.thread_count = (size_t)im_arg_int_range(0, 1, 1024);
+			tracer.thread_count = (uint32_t)im_arg_int_range(0, 1, 1024);
 		}
 	}
 
 	if (source_path.empty()) fatalf("Error: Source path not specified");
 	if (output_path.empty()) fatalf("Error: Output path not specified");
 
+	ufbx_os_thread_pool_opts thread_opts = { };
+	thread_opts.max_threads = tracer.thread_count;
+
+	tracer.thread_pool.reset(ufbx_os_create_thread_pool(&thread_opts));
+	if (!tracer.thread_pool) fatalf("Error: Failed to create thread pool");
+
 	ufbx_load_opts opts = { };
 	opts.target_axes = ufbx_axes_right_handed_y_up;
 	opts.target_unit_meters = 1.0f;
 	opts.generate_missing_normals = true;
+	ufbx_os_init_ufbx_thread_pool(&opts.thread_opts.pool, tracer.thread_pool.get());
 
 	ufbx_error error;
 	ufbx_unique_ptr<ufbx_scene> scene { ufbx_load_file(source_path, &opts, &error) };
