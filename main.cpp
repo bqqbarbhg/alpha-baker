@@ -20,6 +20,8 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <chrono>
+#include <algorithm>
 
 [[noreturn]] void fatalf(const char *fmt, ...)
 {
@@ -36,6 +38,7 @@ std::nullopt_t failf(const char *fmt, ...)
 {
 	va_list args;
 	va_start(args, fmt);
+	fprintf(stderr, "\n");
 	vfprintf(stderr, fmt, args);
 	fprintf(stderr, "\n");
 	va_end(args);
@@ -415,8 +418,8 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 	}
 
 	if (state.tiles.empty()) {
-		printf("Warning: No tiles\n");
-		return true;
+		printf("\nWarning: No tiles\n");
+		return false;
 	}
 
 	const uint32_t total_progress = 32;
@@ -426,8 +429,6 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 		state.tiles[index].progress_count++;
 	}
 
-	printf("Processing ");
-
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < tracer.thread_count; i++) {
 		threads.push_back(std::thread(trace_thread, std::ref(tracer), std::ref(state)));
@@ -436,8 +437,6 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 	for (std::thread &t : threads) {
 		t.join();
 	}
-
-	printf("\n");
 
 	return true;
 }
@@ -572,18 +571,40 @@ int main(int argc, char **argv)
 	printf("Found %zu models, starting to bake: %zux%zu texture, %zu samples/pixel.\nPress ctrl+C to cancel.\n\n",
 		entries.size(), tracer.target.width, tracer.target.height, tracer.samples);
 
+	std::vector<std::string> order;
+	for (const auto &[name, _] : entries) {
+		order.push_back(name);
+	}
+	std::stable_sort(order.begin(), order.end());
+
 	size_t ok_count = 0;
+	size_t warning_count = 0;
 	size_t total_count = 0;
-	for (const auto &[name, entry] : entries) {
+	for (const std::string &name : order) {
+		const BakeEntry &entry = entries.find(name)->second;
 
-		printf("> %s\n", name.c_str());
+		printf("> %-30s ", name.c_str());
 
+		std::chrono::time_point begin = std::chrono::high_resolution_clock::now();
 		auto result = process_entry(tracer, entry);
-		if (result) ok_count++;
+		std::chrono::time_point end = std::chrono::high_resolution_clock::now();
+
+		if (result) {
+			double time_seconds = std::chrono::duration<double>(end - begin).count();
+			printf("%7.2fs\n", time_seconds);
+
+			if (!result.value()) warning_count++;
+			ok_count++;
+		}
 		total_count++;
 	}
 
-	printf("\n%zu/%zu succeeded\n", ok_count, total_count);
+	printf("\n");
+	if (warning_count > 0) {
+		printf("%zu/%zu succeeded (%zu warnings)\n", ok_count, total_count, warning_count);
+	} else {
+		printf("%zu/%zu succeeded\n", ok_count, total_count);
+	}
 
 	save_result(tracer.target, output_path, invert_y);
 	printf("Saved output to: %s\n", output_path.c_str());
