@@ -46,7 +46,7 @@ static rtk_vec3 to_rtk(const um_vec3 &v) { return { v.x, v.y, v.z }; }
 	va_list args;
 	va_start(args, fmt);
 	vfprintf(stderr, fmt, args);
-	fprintf(stderr, "\n");
+	fprintf(stderr, "\n\n");
 	va_end(args);
 
 	exit(1);
@@ -508,20 +508,35 @@ int main(int argc, char **argv)
 
 	im_arg_begin_c(argc, argv);
 	while (im_arg_next()) {
-		im_arg_help("--help", "Show help");
+		if (im_arg_empty()) {
+			im_arg_show_help();
+		}
 
-		if (im_arg("path", "Path for input .fbx file")) {
+		im_arg_helpf("\nUsage: alpha-baker input.fbx -o output.png\n");
+
+		im_arg_helpf("\n"
+			" Bake high-poly geometry into mask for a low-poly mesh.\n"
+			" This tool matches the high and low poly meshes using a suffix (default ' High' and ' Low').\n"
+			" For example, mesh 'Grass High' would be baked into mesh 'Grass Low'.\n");
+
+		im_arg_category("Files");
+		if (im_arg("-i path", "Path for input .fbx file")) {
 			source_path = im_arg_str(0);
 		}
 		if (im_arg("-o output", "Output .png path")) {
 			output_path = im_arg_str(0);
 		}
 
-		im_arg_category("Options");
-		if (im_arg("--resolution R", "Output texture resolution")) {
+		im_arg_category("Texture");
+		if (im_arg("--resolution N", "Output texture resolution")) {
 			resolution = (size_t)im_arg_int_range(0, 1, 1 << 18);
 		}
-		if (im_arg("--samples S", "Number of samples to use")) {
+		if (im_arg("--invert-y", "Invert Y axis in the result")) {
+			invert_y = true;
+		}
+
+		im_arg_category("Baking");
+		if (im_arg("--samples N", "Number of samples to use for baking")) {
 			tracer.samples = (size_t)im_arg_int_range(0, 1, INT_MAX);
 		}
 		if (im_arg("--high-suffix suffix", "Suffix for high-poly meshes")) {
@@ -530,23 +545,27 @@ int main(int argc, char **argv)
 		if (im_arg("--low-suffix suffix", "Suffix for low-poly meshes")) {
 			low_suffix = im_arg_str(0);
 		}
-		if (im_arg("--ray-range range", "Ray distance range")) {
+		if (im_arg("--distance range", "Ray distance from low-poly geometry")) {
 			float dist = (float)im_arg_double_range(0, 0.0, 10000000.0);
 			tracer.ray_dist_back = dist;
 			tracer.ray_dist_front = dist;
 		}
-		if (im_arg("--invert-y", "Invert Y axis in the result")) {
-			invert_y = true;
+		if (im_arg("--distance-separate front back", "Ray distance range (separate distances for front and back)")) {
+			tracer.ray_dist_front = (float)im_arg_double_range(0, 0.0, 10000000.0);
+			tracer.ray_dist_back = (float)im_arg_double_range(0, 0.0, 10000000.0);
 		}
 
-		im_arg_category("Performance");
+		im_arg_category("Other");
 		if (im_arg("--threads N", "Number of threads to use")) {
 			tracer.thread_count = (uint32_t)im_arg_int_range(0, 1, 1024);
 		}
+		im_arg_help("--help", "Show this help");
+
+		im_arg_helpf("\n");
 	}
 
-	if (source_path.empty()) fatalf("Error: Source path not specified");
-	if (output_path.empty()) fatalf("Error: Output path not specified");
+	if (source_path.empty()) fatalf("Error: Source path not specified, specify input with '-i InputFile.fbx'");
+	if (output_path.empty()) fatalf("Error: Output path not specified, specify output with '-o OutputFile.png'");
 
 	ufbx_os_thread_pool_opts thread_opts = { };
 	thread_opts.max_threads = tracer.thread_count;
@@ -594,7 +613,7 @@ int main(int argc, char **argv)
 
 	if (entries.empty()) fatalf("No models found, see --help for configuration options");
 
-	printf("Found %zu models, starting to bake: %zux%zu texture, %zu samples/pixel.\nPress ctrl+C to cancel.\n\n",
+	printf("\nFound %zu models, starting to bake. (ctrl+C to cancel)\n> %zux%zu texture, %zu samples/pixel\n\n",
 		entries.size(), tracer.target.width, tracer.target.height, tracer.samples);
 
 	std::vector<std::string> order;
@@ -603,13 +622,18 @@ int main(int argc, char **argv)
 	}
 	std::stable_sort(order.begin(), order.end());
 
+	int count_digits = 1;
+	for (size_t n = entries.size(); n >= 10; n /= 10) {
+		count_digits++;
+	}
+
 	size_t ok_count = 0;
 	size_t warning_count = 0;
 	size_t total_count = 0;
 	for (const std::string &name : order) {
 		const BakeEntry &entry = entries.find(name)->second;
 
-		printf("> %-30s ", name.c_str());
+		printf("%0*zu/%zu %-30s ", count_digits, total_count + 1, order.size(), name.c_str());
 
 		std::chrono::time_point begin = std::chrono::high_resolution_clock::now();
 		auto result = process_entry(tracer, entry);
@@ -633,7 +657,7 @@ int main(int argc, char **argv)
 	}
 
 	save_result(tracer.target, output_path, invert_y);
-	printf("Saved output to: %s\n", output_path.c_str());
+	printf("Saved output to: %s\n\n", output_path.c_str());
 
 	if (ok_count < total_count)
 		return 1;

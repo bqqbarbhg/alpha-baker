@@ -30,23 +30,17 @@ bool im_arg_help(const char *help, const char *description);
 void im_arg_helpf(const char *fmt, ...);
 void im_arg_vhelpf(const char *fmt, va_list args);
 
-size_t im_arg_count();
 int im_arg_int(size_t index);
 int im_arg_int_range(size_t index, int min_value, int max_value);
 double im_arg_double(size_t index);
 double im_arg_double_range(size_t index, double min_value, double max_value);
 const char *im_arg_str(size_t index);
 
-void im_arg_fail(const char *description);
-void im_arg_failf(const char *fmt, ...);
-
-void im_arg_check(bool condition, const char *description);
-void im_arg_checkf(bool condition, const char *fmt, ...);
-
 void im_arg_category(const char *description);
 
 bool im_arg(const char *fmt, const char *description);
 bool im_arg_unknown();
+bool im_arg_empty();
 
 typedef struct im_arg_context im_arg_context;
 
@@ -70,6 +64,7 @@ bool im_arg_next_ctx(im_arg_context *ctx);
 void im_arg_category_ctx(im_arg_context *ctx, const char *description);
 bool im_arg_ctx(im_arg_context *ctx, const char *fmt, const char *description);
 bool im_arg_unknown_ctx(im_arg_context *ctx);
+bool im_arg_empty_ctx(im_arg_context *ctx);
 
 #if defined(__cplusplus)
 }
@@ -90,6 +85,7 @@ bool im_arg_unknown_ctx(im_arg_context *ctx);
 typedef enum {
 	IM_ARG__STATE_INITIAL,
 	IM_ARG__STATE_PARSE,
+	IM_ARG__STATE_EMPTY,
 	IM_ARG__STATE_MAIN_OPT,
 	IM_ARG__STATE_MAIN_ARG,
 	IM_ARG__STATE_CHECK,
@@ -160,6 +156,7 @@ struct im_arg_context {
 	size_t start_index;
 	size_t index;
 	bool handled;
+	bool pending_empty;
 
 	bool *argv_handled;
 
@@ -294,7 +291,7 @@ static void im_arg__parse_arg(im_arg__arg *arg, const char **fmt, size_t offset)
 
 static im_arg__str_span im_arg__opt_name(im_arg_context *ctx, im_arg__opt *opt, const char *fmt)
 {
-	im_arg__str_span res;
+	im_arg__str_span res = { 0 };
 	if (opt->alias_count > 0) {
 		size_t last = opt->alias_count - 1;
 		res.ptr = fmt;
@@ -303,6 +300,12 @@ static im_arg__str_span im_arg__opt_name(im_arg_context *ctx, im_arg__opt *opt, 
 		im_arg__arg *arg = &ctx->args[opt->arg_offset];
 		res.ptr = fmt + arg->offset;
 		res.len = (int)arg->length;
+	} else if (opt->positional_length > 0) {
+		res.ptr = fmt;
+		res.len = opt->positional_length;
+	} else {
+		res.ptr = fmt;
+		res.len = strlen(fmt);
 	}
 	return res;
 }
@@ -500,6 +503,11 @@ bool im_arg_unknown()
 	return im_arg_unknown_ctx(&im_arg_global);
 }
 
+bool im_arg_empty()
+{
+	return im_arg_empty_ctx(&im_arg_global);
+}
+
 static void im_arg_printf(im_arg_context *ctx, const char *fmt, ...)
 {
 }
@@ -536,6 +544,13 @@ bool im_arg_next_ctx(im_arg_context *ctx)
 		ctx->state = IM_ARG__STATE_PARSE;
 		return true;
 	} else if (ctx->state == IM_ARG__STATE_PARSE) {
+		if (ctx->pending_empty) {
+			ctx->state = IM_ARG__STATE_EMPTY;
+			return true;
+		}
+		ctx->state = IM_ARG__STATE_MAIN_OPT;
+		return im_arg_next_ctx(ctx);
+	} else if (ctx->state == IM_ARG__STATE_EMPTY) {
 		ctx->state = IM_ARG__STATE_MAIN_OPT;
 		return im_arg_next_ctx(ctx);
 	} else if (ctx->state == IM_ARG__STATE_MAIN_OPT || ctx->state == IM_ARG__STATE_MAIN_ARG) {
@@ -610,7 +625,7 @@ void im_arg_category_ctx(im_arg_context *ctx, const char *description)
 	}
 
 	if (ctx->state == IM_ARG__STATE_HELP) {
-		printf("%s\n", description);
+		printf("\n%s\n", description);
 	}
 }
 
@@ -795,6 +810,19 @@ bool im_arg_unknown_ctx(im_arg_context *ctx)
 	if (ctx->state == IM_ARG__STATE_MAIN_ARG && !ctx->handled) {
 		ctx->handled = true;
 		return true;
+	} else {
+		return false;
+	}
+}
+
+bool im_arg_empty_ctx(im_arg_context *ctx)
+{
+	if (ctx->state == IM_ARG__STATE_EMPTY) {
+		ctx->handled = true;
+		return true;
+	} else if (ctx->state == IM_ARG__STATE_PARSE && ctx->argc == 0) {
+		ctx->pending_empty = true;
+		return false;
 	} else {
 		return false;
 	}
