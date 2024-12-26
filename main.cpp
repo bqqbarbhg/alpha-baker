@@ -95,12 +95,21 @@ struct PixelRegion
 	size_t max_x, max_y;
 };
 
+struct TraceTile
+{
+	PixelRegion region;
+	size_t progress_count;
+};
+
 struct TraceState
 {
 	const Mesh &low_mesh;
 	const rtk_scene *low_uv_scene;
 	const rtk_scene *high_scene;
+
 	std::atomic_uint32_t tile_index;
+	std::vector<TraceTile> tiles;
+
 	PixelRegion region;
 };
 
@@ -115,7 +124,6 @@ struct Tracer
 	size_t thread_count;
 	size_t tiles_x;
 	size_t tiles_y;
-	size_t tile_count;
 
 	float ray_dist_front;
 	float ray_dist_back;
@@ -207,24 +215,14 @@ um_vec2 halton_sequence(size_t index, size_t count)
 	return { u, v };
 }
 
-void trace_tile(Tracer &tracer, TraceState &state, size_t x, size_t y, size_t tile_index)
+void trace_tile(Tracer &tracer, TraceState &state, PixelRegion tile)
 {
 	Target &target = tracer.target;
 
-	size_t min_x = x * tracer.tile_size; 
-	size_t min_y = y * tracer.tile_size; 
-	size_t max_x = std::min(min_x + tracer.tile_size, target.width);
-	size_t max_y = std::min(min_y + tracer.tile_size, target.height);
+	float local_values[Tracer::tile_size][Tracer::tile_size] = { };
 
-	if (min_x >= state.region.max_x) return;
-	if (min_y >= state.region.max_y) return;
-	if (max_x <= state.region.min_x) return;
-	if (max_y <= state.region.min_y) return;
-
-	float tile[Tracer::tile_size][Tracer::tile_size] = { };
-
-	for (size_t x = min_x; x < max_x; x++) {
-		for (size_t y = min_y; y < max_y; y++) {
+	for (size_t x = tile.min_x; x < tile.max_x; x++) {
+		for (size_t y = tile.min_y; y < tile.max_y; y++) {
 
 			float sum = 0.0f;
 			for (size_t i = 0; i < tracer.samples; i++) {
@@ -259,35 +257,60 @@ void trace_tile(Tracer &tracer, TraceState &state, size_t x, size_t y, size_t ti
 				sum += 1.0f;
 			}
 
-			tile[y - min_y][x - min_x] = sum / (float)tracer.samples;
+			local_values[y - tile.min_y][x - tile.min_x] = sum / (float)tracer.samples;
 		}
 	}
 
-	for (size_t x = min_x; x < max_x; x++) {
-		for (size_t y = min_y; y < max_y; y++) {
+	for (size_t x = tile.min_x; x < tile.max_x; x++) {
+		for (size_t y = tile.min_y; y < tile.max_y; y++) {
 			float &result = target.at(x, y);
-			result = std::max(result, tile[y - min_y][x - min_x]);
+			result = std::max(result, local_values[y - tile.min_y][x - tile.min_x]);
 		}
+	}
+}
+
+void print_progress(Tracer &tracer, size_t &pending_progress, bool force)
+{
+	std::unique_lock<std::mutex> lock { tracer.print_mutex, std::defer_lock };
+	if (force) {
+		lock.lock();
+	} else {
+		if (!lock.try_lock()) return;
+	}
+
+	if (lock.owns_lock()) {
+		char buffer[64];
+		size_t count = pending_progress;
+		assert(count < 64);
+		for (size_t i = 0; i < count; i++) {
+			buffer[i] = '.';
+		}
+		buffer[count] = '\0';
+		printf("%s", buffer);
+		fflush(stdout);
+		pending_progress = 0;
 	}
 }
 
 void trace_thread(Tracer &tracer, TraceState &state)
 {
-	size_t report_rate = std::max(tracer.tile_count / 32, (size_t)1);
+	size_t tile_count = state.tiles.size();
+	size_t pending_progress = 0;
 
 	for (;;) {
 		size_t tile_index = state.tile_index.fetch_add(1u, std::memory_order_relaxed);
-		if (tile_index >= tracer.tile_count) break;
+		if (tile_index >= tile_count) break;
 
-		size_t tile_x = tile_index % tracer.tiles_x;
-		size_t tile_y = tile_index / tracer.tiles_y;
-		trace_tile(tracer, state, tile_x, tile_y, tile_index);
+		const TraceTile &tile = state.tiles[tile_index];
+		trace_tile(tracer, state, tile.region);
+		pending_progress += tile.progress_count;
 
-		if (((tile_index + 1) % report_rate) == 0) {
-			std::lock_guard lg { tracer.print_mutex };
-			putchar('.');
+		if (pending_progress > 0) {
+			print_progress(tracer, pending_progress, false);
 		}
 	}
+
+	print_progress(tracer, pending_progress, true);
 }
 
 std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
@@ -352,8 +375,6 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 		if (!high_scene) return failf("Failed to create high-poly raytracing scene");
 	}
 
-	printf("Processing ");
-
 	TraceState state = { low_mesh };
 	state.low_uv_scene = low_uv_scene.get();
 	state.high_scene = high_scene.get();
@@ -376,6 +397,36 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 		state.region.max_x = (size_t)clamp(max_uv.x * width + 1.0f, 0.0f, width);
 		state.region.max_y = (size_t)clamp(max_uv.y * height + 1.0f, 0.0f, width);
 	}
+
+	for (size_t tile_y = 0; tile_y < tracer.tiles_y; tile_y++) {
+		for (size_t tile_x = 0; tile_x < tracer.tiles_x; tile_x++) {
+			size_t min_x = tile_x * tracer.tile_size; 
+			size_t min_y = tile_y * tracer.tile_size; 
+			size_t max_x = std::min(min_x + tracer.tile_size, tracer.target.width);
+			size_t max_y = std::min(min_y + tracer.tile_size, tracer.target.height);
+
+			if (min_x >= state.region.max_x) continue;
+			if (min_y >= state.region.max_y) continue;
+			if (max_x <= state.region.min_x) continue;
+			if (max_y <= state.region.min_y) continue;
+
+			state.tiles.push_back({ min_x, min_y, max_x, max_y });
+		}
+	}
+
+	if (state.tiles.empty()) {
+		printf("Warning: No tiles\n");
+		return true;
+	}
+
+	const uint32_t total_progress = 32;
+	double max_tile = (double)(state.tiles.size() - 1);
+	for (uint32_t prog = 0; prog < total_progress; prog++) {
+		size_t index = clamp((double)prog / (double)(total_progress - 1) * max_tile, 0.0, max_tile);
+		state.tiles[index].progress_count++;
+	}
+
+	printf("Processing ");
 
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < tracer.thread_count; i++) {
@@ -494,7 +545,6 @@ int main(int argc, char **argv)
 
 	tracer.tiles_x = (tracer.target.width + Tracer::tile_size - 1) / Tracer::tile_size;
 	tracer.tiles_y = (tracer.target.height + Tracer::tile_size - 1) / Tracer::tile_size;
-	tracer.tile_count = tracer.tiles_x * tracer.tiles_y;
 
 	tracer.sample_offsets.resize(tracer.samples);
 	for (size_t i = 0; i < tracer.samples; i++) {
