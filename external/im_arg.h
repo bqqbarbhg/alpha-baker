@@ -32,6 +32,7 @@ void im_arg_vhelpf(const char *fmt, va_list args);
 
 size_t im_arg_count();
 int im_arg_int(size_t index);
+int im_arg_int_range(size_t index, int min_value, int max_value);
 const char *im_arg_str(size_t index);
 
 void im_arg_fail(const char *description);
@@ -52,6 +53,7 @@ void im_arg_begin_c_ctx(im_arg_context *ctx, int argc, char **argv);
 
 size_t im_arg_count_ctx(im_arg_context *ctx);
 int im_arg_int_ctx(im_arg_context *ctx, size_t index);
+int im_arg_int_range_ctx(im_arg_context *ctx, size_t index, int min_value, int max_value);
 const char *im_arg_str_ctx(im_arg_context *ctx, size_t index);
 
 void im_arg_show_help_ctx(im_arg_context *ctx);
@@ -358,6 +360,11 @@ int im_arg_int(size_t index)
 	return im_arg_int_ctx(&im_arg_global, index);
 }
 
+int im_arg_int_range(size_t index, int min_value, int max_value)
+{
+	return im_arg_int_range_ctx(&im_arg_global, index, min_value, max_value);
+}
+
 const char *im_arg_str_ctx(im_arg_context *ctx, size_t index)
 {
 	im_arg__assert(index < ctx->arg_count);
@@ -371,11 +378,34 @@ size_t im_arg_count_ctx(im_arg_context *ctx)
 
 int im_arg_int_ctx(im_arg_context *ctx, size_t index)
 {
+	return im_arg_int_range_ctx(ctx, index, INT_MIN, INT_MAX);
+}
+
+int im_arg_int_range_ctx(im_arg_context *ctx, size_t index, int min_value, int max_value)
+{
 	const char *arg = im_arg_str_ctx(ctx, index);
 	char *end = NULL;
 	long value = strtol(arg, &end, 10);
 	if (!end || *end) {
-		im_arg__errorf(ctx, "expected integer for '%s' argument %zu, got '%s'", ctx->opt, index, arg);
+		if (ctx->arg_count == 1) {
+			im_arg__errorf(ctx, "expected integer for '%s', got '%s'", ctx->opt, arg);
+		} else {
+			im_arg__errorf(ctx, "expected integer for '%s' argument %zu, got '%s'", ctx->opt, index, arg);
+		}
+	}
+	if (value < min_value) {
+		if (ctx->arg_count == 1) {
+			im_arg__errorf(ctx, "value for '%s' is too low, minimum is %d", ctx->opt, min_value);
+		} else {
+			im_arg__errorf(ctx, "value for '%s' argument %zu is too low, minimum is %d", ctx->opt, index, min_value);
+		}
+	}
+	if (value > max_value) {
+		if (ctx->arg_count == 1) {
+			im_arg__errorf(ctx, "value for '%s' is too high, maximum is %d", ctx->opt, max_value);
+		} else {
+			im_arg__errorf(ctx, "value for '%s' argument %zu is too high, maximum is %d", ctx->opt, index, max_value);
+		}
 	}
 	return (int)value;
 }
