@@ -80,7 +80,7 @@ bool im_arg_empty_ctx(im_arg_context *ctx);
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <float.h>
+#include <math.h>
 
 typedef enum {
 	IM_ARG__STATE_INITIAL,
@@ -305,7 +305,7 @@ static im_arg__str_span im_arg__opt_name(im_arg_context *ctx, im_arg__opt *opt, 
 		res.len = opt->positional_length;
 	} else {
 		res.ptr = fmt;
-		res.len = strlen(fmt);
+		res.len = (int)strlen(fmt);
 	}
 	return res;
 }

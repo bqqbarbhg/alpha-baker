@@ -13,8 +13,5 @@
 #define UMATH_IMPLEMENTATION
 #include "external/umath.h"
 
-#define IM_ARG_IMPLEMENTATION
-#include "external/im_arg.h"
-
 #include "external/ufbx.c.h"
 #include "external/rtk.c.h"

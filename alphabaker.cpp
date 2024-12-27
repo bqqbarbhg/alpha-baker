@@ -1,3 +1,5 @@
+#include "alphabaker.h"
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -12,7 +14,6 @@
 #include "external/rtk.h"
 #include "external/stb_image.h"
 #include "external/stb_image_write.h"
-#include "external/im_arg.h"
 
 #include <string_view>
 #include <unordered_map>
@@ -41,15 +42,16 @@ template<> struct std::default_delete<ufbx_os_thread_pool> {
 static um_vec3 from_rtk(const rtk_vec3 &v) { return { v.x, v.y, v.z }; }
 static rtk_vec3 to_rtk(const um_vec3 &v) { return { v.x, v.y, v.z }; }
 
-[[noreturn]] void fatalf(const char *fmt, ...)
+AlphaBaker_Result fatalf(AlphaBaker_Result result, const char *fmt, ...)
 {
 	va_list args;
 	va_start(args, fmt);
+	fprintf(stderr, "Error: ");
 	vfprintf(stderr, fmt, args);
 	fprintf(stderr, "\n\n");
 	va_end(args);
 
-	exit(1);
+	return result;
 }
 
 std::nullopt_t failf(const char *fmt, ...)
@@ -460,7 +462,7 @@ std::optional<bool> process_entry(Tracer &tracer, const BakeEntry &entry)
 	return true;
 }
 
-void save_result(const Target &target, const std::string &path, bool invert_y)
+AlphaBaker_Result save_result(const Target &target, const std::string &path, bool invert_y)
 {
 	size_t pixel_count = target.width * target.height;
 	std::vector<uint8_t> result;
@@ -485,93 +487,75 @@ void save_result(const Target &target, const std::string &path, bool invert_y)
 	}
 
 	if (!stbi_write_png(path.c_str(), (int)target.width, (int)target.height, 3, result.data(), 0)) {
-		fatalf("Failed to write output file");
+		return fatalf(AlphaBaker_FailedToWriteOutput, "Failed to write output file");
 	}
 }
 
-int main(int argc, char **argv)
+static AlphaBaker_String to_option(const char *str)
 {
-	std::string source_path;
-	std::string output_path;
+	return { str, (int)strlen(str) };
+}
 
-	std::string_view high_suffix = " High";
-	std::string_view low_suffix = " Low";
+static std::string_view from_option(AlphaBaker_String str)
+{
+	if (str.length < 0) {
+		return { str.data };
+	} else {
+		return { str.data, (size_t)str.length };
+	}
+}
 
-	size_t resolution = 1024;
-	bool invert_y = false;
+extern "C" {
+
+ALPHABAKER_API void AlphaBaker_defaults(AlphaBaker_Options *options)
+{
+	if (!options) return;
+	AlphaBaker_Options &opts = *options;
+
+	memset(options, 0, sizeof(AlphaBaker_Options));
+
+	opts.low_suffix = to_option(" Low");
+	opts.high_suffix = to_option(" High");
+	opts.resolution = 1024;
+	opts.samples = 256;
+	opts.ray_dist_front = 1000.0f;
+	opts.ray_dist_back = 1000.0f;
+	opts.thread_count = -1;
+}
+
+ALPHABAKER_API void AlphaBaker_parseOptions(AlphaBaker_Options *options, char **arguments, int count)
+{
+}
+
+ALPHABAKER_API int AlphaBaker_bake(const AlphaBaker_Options *options)
+{
+	if (!options) return fatalf(AlphaBaker_InvalidOptions, "Error: No options provided");
+	const AlphaBaker_Options &input = *options;
+
+	std::string source_path { from_option(input.source_path) };
+	std::string output_path { from_option(input.output_path) };
+
+	if (source_path.empty()) fatalf(AlphaBaker_InvalidOptions, "Source path not specified");
+	if (output_path.empty()) fatalf(AlphaBaker_InvalidOptions, "Output path not specified");
+	if (input.resolution <= 0) fatalf(AlphaBaker_InvalidOptions, "Resolution must be greater or equal to 1");
+	if (input.samples <= 0) fatalf(AlphaBaker_InvalidOptions, "Samples must be greater or equal to 1");
+	if (input.ray_dist_front < 0.0f) fatalf(AlphaBaker_InvalidOptions, "Ray distance must be non-negative");
+	if (input.ray_dist_back < 0.0f) fatalf(AlphaBaker_InvalidOptions, "Ray distance must be non-negative");
+	if (input.thread_count == 0) fatalf(AlphaBaker_InvalidOptions, "Thread count is zero, speicify or use -1 for automatic");
+
+	size_t resolution = (size_t)input.resolution;
 
 	Tracer tracer = { };
-	tracer.thread_count = (uint32_t)std::thread::hardware_concurrency();
-	tracer.ray_dist_front = 1000.0f;
-	tracer.ray_dist_back = 1000.0f;
-	tracer.samples = 256;
-
-	im_arg_begin_c(argc, argv);
-	while (im_arg_next()) {
-		if (im_arg_empty()) {
-			im_arg_show_help();
-		}
-
-		im_arg_helpf("\nUsage: alpha-baker input.fbx -o output.png\n");
-
-		im_arg_helpf("\n"
-			" Bake high-poly geometry into mask for a low-poly mesh.\n"
-			" This tool matches the high and low poly meshes using a suffix (default ' High' and ' Low').\n"
-			" For example, mesh 'Grass High' would be baked into mesh 'Grass Low'.\n");
-
-		im_arg_category("Files");
-		if (im_arg("-i path", "Path for input .fbx file")) {
-			source_path = im_arg_str(0);
-		}
-		if (im_arg("-o output", "Output .png path")) {
-			output_path = im_arg_str(0);
-		}
-
-		im_arg_category("Texture");
-		if (im_arg("--resolution N", "Output texture resolution")) {
-			resolution = (size_t)im_arg_int_range(0, 1, 1 << 18);
-		}
-		if (im_arg("--invert-y", "Invert Y axis in the result")) {
-			invert_y = true;
-		}
-
-		im_arg_category("Baking");
-		if (im_arg("--samples N", "Number of samples to use for baking")) {
-			tracer.samples = (size_t)im_arg_int_range(0, 1, INT_MAX);
-		}
-		if (im_arg("--high-suffix suffix", "Suffix for high-poly meshes")) {
-			high_suffix = im_arg_str(0);
-		}
-		if (im_arg("--low-suffix suffix", "Suffix for low-poly meshes")) {
-			low_suffix = im_arg_str(0);
-		}
-		if (im_arg("--distance range", "Ray distance from low-poly geometry")) {
-			float dist = (float)im_arg_double_range(0, 0.0, 10000000.0);
-			tracer.ray_dist_back = dist;
-			tracer.ray_dist_front = dist;
-		}
-		if (im_arg("--distance-separate front back", "Ray distance range (separate distances for front and back)")) {
-			tracer.ray_dist_front = (float)im_arg_double_range(0, 0.0, 10000000.0);
-			tracer.ray_dist_back = (float)im_arg_double_range(0, 0.0, 10000000.0);
-		}
-
-		im_arg_category("Other");
-		if (im_arg("--threads N", "Number of threads to use")) {
-			tracer.thread_count = (uint32_t)im_arg_int_range(0, 1, 1024);
-		}
-		im_arg_help("--help", "Show this help");
-
-		im_arg_helpf("\n");
-	}
-
-	if (source_path.empty()) fatalf("Error: Source path not specified, specify input with '-i InputFile.fbx'");
-	if (output_path.empty()) fatalf("Error: Output path not specified, specify output with '-o OutputFile.png'");
+	tracer.thread_count = input.thread_count > 0 ? (uint32_t)input.thread_count : (uint32_t)std::thread::hardware_concurrency();
+	tracer.ray_dist_front = input.ray_dist_front;
+	tracer.ray_dist_back = input.ray_dist_back;
+	tracer.samples = (size_t)input.samples;
 
 	ufbx_os_thread_pool_opts thread_opts = { };
 	thread_opts.max_threads = tracer.thread_count;
 
 	tracer.thread_pool.reset(ufbx_os_create_thread_pool(&thread_opts));
-	if (!tracer.thread_pool) fatalf("Error: Failed to create thread pool");
+	if (!tracer.thread_pool) fatalf(AlphaBaker_InternalError, "Error: Failed to create thread pool");
 
 	ufbx_load_opts opts = { };
 	opts.target_axes = ufbx_axes_right_handed_y_up;
@@ -582,7 +566,8 @@ int main(int argc, char **argv)
 	ufbx_error error;
 	ufbx_unique_ptr<ufbx_scene> scene { ufbx_load_file(source_path, &opts, &error) };
 	if (!scene) {
-		fatalf("Failed to load: %s\n%s", source_path, ufbx_format_error_string(error).c_str());
+		if (error.type == UFBX_ERROR_FILE_NOT_FOUND) return fatalf(AlphaBaker_InputFileNotFound, "Input file not found: %s\n", source_path.c_str());
+		return fatalf(AlphaBaker_BadInputFile, "Failed to load: %s\n%s", source_path.c_str(), ufbx_format_error_string(error).c_str());
 	}
 
 	tracer.target = Target{ resolution, resolution };
@@ -596,6 +581,9 @@ int main(int argc, char **argv)
 	}
 
 	std::unordered_map<std::string, BakeEntry> entries;
+
+	std::string_view low_suffix = from_option(input.low_suffix);
+	std::string_view high_suffix = from_option(input.high_suffix);
 
 	for (ufbx_node *node : scene->nodes) {
 		std::string_view name = node->name;
@@ -611,7 +599,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (entries.empty()) fatalf("No models found, see --help for configuration options");
+	if (entries.empty()) return fatalf(AlphaBaker_NoApplicableMeshes, "No applicable meshes found");
 
 	printf("\nFound %zu models, starting to bake. (ctrl+C to cancel)\n> %zux%zu texture, %zu samples/pixel\n\n",
 		entries.size(), tracer.target.width, tracer.target.height, tracer.samples);
@@ -656,12 +644,14 @@ int main(int argc, char **argv)
 		printf("%zu/%zu succeeded\n", ok_count, total_count);
 	}
 
-	save_result(tracer.target, output_path, invert_y);
+	AlphaBaker_Result res = save_result(tracer.target, output_path, input.invert_y != 0);
+	if (res != AlphaBaker_Success) return res;
+
 	printf("Saved output to: %s\n\n", output_path.c_str());
 
 	if (ok_count < total_count)
-		return 1;
-
-	return 0;
+		return AlphaBaker_PartialSuccess;
+	return AlphaBaker_Success;
 }
 
+}
