@@ -489,6 +489,8 @@ AlphaBaker_Result save_result(const Target &target, const std::string &path, boo
 	if (!stbi_write_png(path.c_str(), (int)target.width, (int)target.height, 3, result.data(), 0)) {
 		return fatalf(AlphaBaker_FailedToWriteOutput, "Failed to write output file");
 	}
+
+	return AlphaBaker_Success;
 }
 
 static AlphaBaker_String to_option(const char *str)
