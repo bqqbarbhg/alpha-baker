@@ -43,7 +43,6 @@ enum AlphaBaker_Result
 };
 
 ALPHABAKER_API void AlphaBaker_defaults(AlphaBaker_Options *options);
-ALPHABAKER_API void AlphaBaker_parseOptions(AlphaBaker_Options *options, char **arguments, int count);
 ALPHABAKER_API int AlphaBaker_bake(const AlphaBaker_Options *options);
 
 #if defined(__cplusplus)

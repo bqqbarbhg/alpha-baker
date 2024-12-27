@@ -523,10 +523,6 @@ ALPHABAKER_API void AlphaBaker_defaults(AlphaBaker_Options *options)
 	opts.thread_count = -1;
 }
 
-ALPHABAKER_API void AlphaBaker_parseOptions(AlphaBaker_Options *options, char **arguments, int count)
-{
-}
-
 ALPHABAKER_API int AlphaBaker_bake(const AlphaBaker_Options *options)
 {
 	if (!options) return fatalf(AlphaBaker_InvalidOptions, "Error: No options provided");
@@ -535,13 +531,13 @@ ALPHABAKER_API int AlphaBaker_bake(const AlphaBaker_Options *options)
 	std::string source_path { from_option(input.source_path) };
 	std::string output_path { from_option(input.output_path) };
 
-	if (source_path.empty()) fatalf(AlphaBaker_InvalidOptions, "Source path not specified");
-	if (output_path.empty()) fatalf(AlphaBaker_InvalidOptions, "Output path not specified");
-	if (input.resolution <= 0) fatalf(AlphaBaker_InvalidOptions, "Resolution must be greater or equal to 1");
-	if (input.samples <= 0) fatalf(AlphaBaker_InvalidOptions, "Samples must be greater or equal to 1");
-	if (input.ray_dist_front < 0.0f) fatalf(AlphaBaker_InvalidOptions, "Ray distance must be non-negative");
-	if (input.ray_dist_back < 0.0f) fatalf(AlphaBaker_InvalidOptions, "Ray distance must be non-negative");
-	if (input.thread_count == 0) fatalf(AlphaBaker_InvalidOptions, "Thread count is zero, speicify or use -1 for automatic");
+	if (source_path.empty()) return fatalf(AlphaBaker_InvalidOptions, "Source path not specified");
+	if (output_path.empty()) return fatalf(AlphaBaker_InvalidOptions, "Output path not specified");
+	if (input.resolution <= 0) return fatalf(AlphaBaker_InvalidOptions, "Resolution must be greater or equal to 1");
+	if (input.samples <= 0) return fatalf(AlphaBaker_InvalidOptions, "Samples must be greater or equal to 1");
+	if (input.ray_dist_front < 0.0f) return fatalf(AlphaBaker_InvalidOptions, "Ray distance must be non-negative");
+	if (input.ray_dist_back < 0.0f) return fatalf(AlphaBaker_InvalidOptions, "Ray distance must be non-negative");
+	if (input.thread_count == 0) return fatalf(AlphaBaker_InvalidOptions, "Thread count is zero, speicify or use -1 for automatic");
 
 	size_t resolution = (size_t)input.resolution;
 
@@ -555,7 +551,7 @@ ALPHABAKER_API int AlphaBaker_bake(const AlphaBaker_Options *options)
 	thread_opts.max_threads = tracer.thread_count;
 
 	tracer.thread_pool.reset(ufbx_os_create_thread_pool(&thread_opts));
-	if (!tracer.thread_pool) fatalf(AlphaBaker_InternalError, "Error: Failed to create thread pool");
+	if (!tracer.thread_pool) return fatalf(AlphaBaker_InternalError, "Error: Failed to create thread pool");
 
 	ufbx_load_opts opts = { };
 	opts.target_axes = ufbx_axes_right_handed_y_up;
